@@ -45,17 +45,17 @@ def add_headers(r):
     r.headers['X-Content-Type-Options'] = 'nosniff'
     return r
 
-ALLOWED = {'monitor_dir','monitor_dirs','crf','codec','container','preset','threads','use_gpu','resize_mode','custom_resize','enabled'}
+ALLOWED = {'monitor_dir','monitor_dirs','crf','codec','container','preset','threads','use_gpu','resize_mode','custom_resize','enabled','min_file_size','dual_worker'}
 CODECS = ('libx264','libx265')
 CONTAINERS = ('mp4','mkv')
 PRESETS = ('ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow')
 RESIZE_MODES = ('keep','1080p','custom')
 DEFAULT = {'monitor_dir':'','monitor_dirs':[],'crf':23,'codec':'libx264','container':'mp4',
-           'preset':'medium','threads':1,'use_gpu':True,'resize_mode':'1080p','custom_resize':'',
+           'preset':'medium','threads':1,'use_gpu':True,'resize_mode':'1080p','custom_resize':'','min_file_size':10,'dual_worker':True,
            'enabled':False}
-MIN_CRF = 18
+MIN_CRF = 12
 MAX_CRF = 32
-MAX_THREADS = 4
+MAX_THREADS = os.cpu_count() or 4
 # 严格按照飞牛官方规范：应用只能浏览
 # 1) TRIM_DATA_ACCESSIBLE_PATHS 中由用户在"应用设置→授权目录"显式授权的目录
 # 2) TRIM_DATA_SHARE_PATHS 中由 config/resource:data-share 声明的共享目录
@@ -167,6 +167,59 @@ def _ensure_problem_schema():
             c.close()
     except Exception as e:
         print(f"_ensure_problem_schema error: {e}")
+
+_pending_cache = {'pending': 0, 'total': 0, 'ts': 0}
+_VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm', '.m4v', '.3gp'}
+
+
+def _count_pending():
+    total = 0
+    def walk(d, depth):
+        nonlocal total
+        if depth > 20:
+            return
+        try:
+            for e in os.scandir(d):
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        walk(e.path, depth + 1)
+                    elif e.is_file() and os.path.splitext(e.name)[1].lower() in _VIDEO_EXTS:
+                        total += 1
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    for d in (cfg.get('monitor_dirs') or []):
+        if d and os.path.isdir(d):
+            walk(d, 0)
+    known = 0
+    try:
+        db = sqlite3.connect(DB_PATH, timeout=5)
+        try:
+            known = db.execute('select count(*) from processed_files where success=1').fetchone()[0]
+            try:
+                known += db.execute('select count(*) from problem_files').fetchone()[0]
+            except sqlite3.Error:
+                pass
+        finally:
+            db.close()
+    except Exception:
+        pass
+    return max(0, total - known), total
+
+
+def _pending_loop():
+    time.sleep(5)
+    while True:
+        try:
+            p, t = _count_pending()
+            _pending_cache.update(pending=p, total=t, ts=time.time())
+        except Exception:
+            pass
+        time.sleep(300)
+
+
+threading.Thread(target=_pending_loop, daemon=True).start()
 
 load_cfg(); init_db()
 
@@ -359,6 +412,9 @@ def _parse_process_state(lines):
             continue
         if any(k in clean for k in activity_keywords):
             state['current_activity'] = clean
+    # 没有正在转码时进度归零
+    if state['current_activity'] and '转码进度:' not in state['current_activity']:
+        state['progress_percent'] = 0
     return state
 
 def _process_snapshot():
@@ -389,7 +445,7 @@ def _process_snapshot():
 @app.route('/')
 def index():
     _sync_monitor_aliases()
-    return render_template_string(HTML, config=cfg, var_dir=VAR_DIR, conv_log=CONV_LOG, db_path=DB_PATH)
+    return render_template_string(HTML, config=cfg, var_dir=VAR_DIR, conv_log=CONV_LOG, db_path=DB_PATH, max_threads=MAX_THREADS)
 
 @app.route('/api/config', methods=['GET','POST'])
 def api_cfg():
@@ -430,23 +486,117 @@ def api_cfg():
             elif k == 'custom_resize':
                 cfg[k] = str(v or '').strip()
             elif k == 'threads':
-                try: cfg[k] = max(1, min(MAX_THREADS, int(v)))
+                try: cfg[k] = max(0, min(MAX_THREADS, int(v)))
                 except: pass
-            elif k == 'use_gpu': cfg[k] = bool(v)
+            elif k == 'min_file_size':
+                try: cfg[k] = max(0, min(10000, int(v)))
+                except: pass
+            elif k == 'dual_worker': cfg[k] = bool(v) and bool(cfg.get('use_gpu', True))
+            elif k == 'use_gpu':
+                cfg[k] = bool(v)
+                if not cfg[k]: cfg['dual_worker'] = False
         save_cfg()
         _sync_monitor_aliases()
         return jsonify({'success':True, 'config':cfg})
     _sync_monitor_aliases()
     return jsonify(cfg)
 
+def _gpu_devices():
+    try:
+        base = '/dev/dri'
+        out = []
+        for name in os.listdir(base):
+            if name.startswith('renderD'):
+                p = os.path.join(base, name)
+                if os.access(p, os.R_OK | os.W_OK):
+                    out.append(p)
+        return sorted(out)
+    except Exception:
+        return []
+
+
+def _parse_workers(lines):  # FPKC-WORKERS-UI
+    out = {'gpu': {'file': '', 'activity': '', 'percent': 0},
+           'cpu': {'file': '', 'activity': '', 'percent': 0}}
+    for _i in range(len(lines) - 1, -1, -1):
+        if '转码进程启动' in lines[_i]:
+            lines = lines[_i:]
+            break
+    for line in lines:
+        c = line.strip()
+        key = ''
+        if c.startswith('[GPU]'):
+            key, c = 'gpu', c[5:].strip()
+        elif c.startswith('[CPU]'):
+            key, c = 'cpu', c[5:].strip()
+        if not key:
+            continue
+        w = out[key]
+        if '[SERIAL] 开始处理:' in c:
+            w['file'] = c.split('[SERIAL] 开始处理:', 1)[1].strip()
+            w['activity'], w['percent'] = c, 0
+        elif '文件已入队，等待文件稳定:' in c:
+            w['file'] = c.split('文件已入队，等待文件稳定:', 1)[1].split('，剩余约', 1)[0].strip()
+            w['activity'], w['percent'] = c, 0
+        elif c.startswith('开始转码:'):
+            w['file'] = c.split('开始转码:', 1)[1].split(' (大小:', 1)[0].strip()
+            w['activity'] = c
+        elif c.startswith('转码进度:'):
+            try:
+                w['percent'] = float(c.split('转码进度:', 1)[1].split('%', 1)[0])
+            except Exception:
+                pass
+            if '当前文件:' in c:
+                w['file'] = c.split('当前文件:', 1)[1].strip()
+            w['activity'] = c
+        else:
+            w['activity'] = c
+    return out
+
+
+_eta_state = {'gpu': {'pct': 0.0, 'ts': 0.0, 'eta': 0, 'file': ''},
+              'cpu': {'pct': 0.0, 'ts': 0.0, 'eta': 0, 'file': ''}}
+
+
+def _update_eta(workers):
+    now = time.time()
+    for k, st in _eta_state.items():
+        w = workers.get(k) or {}
+        f = w.get('file') or ''
+        p = float(w.get('percent') or 0)
+        if not f:
+            st.update(pct=p, ts=now, eta=0, file='', base_pct=p, base_ts=now)
+            w['eta'] = 0
+            continue
+        if f != st['file'] or p + 1 < st['pct']:
+            st.update(pct=p, ts=now, eta=0, file=f, base_pct=p, base_ts=now)
+            w['eta'] = 0
+            continue
+        st['pct'], st['ts'] = p, now
+        if p >= 99.9:
+            st['eta'] = 0
+            w['eta'] = 0
+            continue
+        dt = now - st.get('base_ts', now)
+        dp = p - st.get('base_pct', 0.0)
+        if dt >= 15 and dp > 0.5:
+            rate = dp / dt
+            raw = int((100.0 - p) / rate)
+            prev = st.get('eta', 0)
+            st['eta'] = raw if prev <= 0 else int(prev * 0.7 + raw * 0.3)
+        w['eta'] = st['eta']
+
+
 @app.route('/api/status')
 def api_status():
     global last_error
     process, lines = _process_snapshot()
+    process['workers'] = _parse_workers(lines)
+    _update_eta(process['workers'])
     display_error = last_error or process.get('last_error', '')
     return jsonify({'running':process['running'], 'config':cfg, 'error':display_error,
                     'process':process, 'recent_log':lines,
-                    'authorized_roots': get_authorized_roots()})
+                    'gpu_devices': _gpu_devices(), 'authorized_roots': get_authorized_roots()})
 
 TEMP_DIR = os.path.join(VAR_DIR, 'temp')
 
@@ -477,8 +627,10 @@ def api_start():
         'crf':cfg.get('crf',23), 'codec':cfg.get('codec','libx264'),
         'container':cfg.get('container','mp4'), 'preset':cfg.get('preset','medium'),
         'threads':cfg.get('threads',1), 'use_gpu':cfg.get('use_gpu',True),
+        'min_file_size_mb':cfg.get('min_file_size',10),
+        'dual_worker':bool(cfg.get('dual_worker',True) and cfg.get('use_gpu',True)),
         'resize_mode':cfg.get('resize_mode','1080p'), 'custom_resize':cfg.get('custom_resize',''),
-        'temp_dir': TEMP_DIR, 'max_depth': 5}, f)
+        'temp_dir': TEMP_DIR, 'max_depth': 20}, f)
     sc = os.path.join(VAR_DIR, 'start_converter.py')
     script_content = '''import sys,os,json,subprocess,traceback,time
 sd=os.path.dirname(os.path.abspath(__file__))
@@ -522,7 +674,7 @@ print(f"temp_dir: {td}")
 if td:
     os.makedirs(td,exist_ok=True)
     print(f"temp_dir 可写: {os.access(td, os.W_OK)}")
-vc=fpkc.VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=td if td else None)
+vc=fpkc.VideoConverter(db,c["crf"],c["codec"],c["container"],c["preset"],c["threads"],c["use_gpu"],temp_dir=td if td else None, min_file_size_mb=c.get("min_file_size_mb", c.get("min_file_size",10)), dual_worker=c.get("dual_worker", True))
 # 透传分辨率策略与自定义 ffmpeg 参数到转码核心
 vc.resize_mode=c.get("resize_mode","1080p")
 vc.custom_resize=c.get("custom_resize","")
@@ -650,10 +802,10 @@ def api_logs():
     logs = []
     for r in rows:
         logs.append({'id':r[0],'filepath':str(r[1]),'file_size':r[2],
-            'file_size_mb':round(r[2]/1048576,2),'processed_at':str(r[3]),
+            'file_size_mb':round(r[2]/1048576,2),'processed_at':str(r[3]),'worker':(str(r[6]) if len(r) > 6 and r[6] else ''),
             'success':bool(r[4]),'saved_size':r[5] or 0,
-            'saved_size_mb':round((r[5] or 0)/1048576,2)})
-    return jsonify({'logs':logs,
+            'saved_size_mb':0 if (r[5] or 0) < 0 else round((r[5] or 0)/1048576,2)})
+    return jsonify({'pending':_pending_cache.get('pending', 0),'total_videos':_pending_cache.get('total', 0),'logs':logs,
                     'total_saved_mb':stats['total_saved_mb'],
                     'total_count':stats['total_count'],
                     'success_count':stats['success_count'],
@@ -812,7 +964,7 @@ def api_browse():
 HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>视频自动转码工具</title><style>
-*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;padding:20px}.c{max-width:1000px;margin:0 auto}.hd{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;padding:28px 32px;border-radius:12px 12px 0 0}.hd h1{font-size:24px;margin-bottom:6px}.hd p{opacity:.85;font-size:14px}.ct{padding:24px 32px;background:#fff;border-radius:0 0 12px 12px;box-shadow:0 1px 3px rgba(0,0,0,.1)}.s{margin-bottom:28px}.st{font-size:16px;font-weight:600;margin-bottom:14px;color:#1f2937;display:flex;align-items:center;gap:8px}.badge{display:inline-block;padding:3px 12px;border-radius:20px;font-size:12px;font-weight:500}.bg{background:#d1fae5;color:#065f46}.br{background:#fee2e2;color:#991b1b}.bg2{display:flex;gap:10px;margin-top:12px}.btn{padding:10px 20px;border:none;border-radius:6px;font-size:14px;font-weight:500;cursor:pointer}.bt1{background:#4f46e5;color:#fff}.bt2{background:#10b981;color:#fff}.bt3{background:#ef4444;color:#fff}.fg{margin-bottom:14px}label{display:block;margin-bottom:5px;font-weight:500;color:#374151;font-size:13px}input,select{width:100%;padding:9px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;background:#f9fafb}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}.sc{background:#f3f4f6;padding:18px;border-radius:8px;text-align:center}.sv{font-size:28px;font-weight:700;color:#4f46e5}.sl{color:#6b7280;margin-top:4px;font-size:13px}.tc{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #e5e7eb}th{background:#f9fafb;font-weight:600;color:#374151}.suc{color:#059669}.err{color:#dc2626}.errmsg{color:#dc2626;font-size:13px;margin-top:8px;padding:8px 12px;background:#fef2f2;border-radius:6px;display:none}.info{color:#6b7280;font-size:12px;margin-top:6px}.process{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:12px}.kv{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px}.kl{font-size:12px;color:#6b7280;margin-bottom:4px}.vv{font-size:13px;color:#111827;word-break:break-all}.pwrap{margin-top:12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px}.pbar{height:12px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin-top:6px}.pfill{height:100%;width:0;background:linear-gradient(90deg,#10b981,#4f46e5);transition:width .3s}.ptext{font-size:12px;color:#374151;margin-top:5px}.logbox{background:#111827;color:#d1d5db;border-radius:8px;padding:12px;max-height:260px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;white-space:pre-wrap}.errbox{background:#fef2f2;color:#991b1b;border:1px solid #fecaca;border-radius:8px;padding:10px;font-size:13px;white-space:pre-wrap;word-break:break-word}</style></head><body><div class="c"><div class="hd">
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;padding:20px}.c{max-width:1000px;margin:0 auto}.hd{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;padding:28px 32px;border-radius:12px 12px 0 0}.hd h1{font-size:24px;margin-bottom:6px}.hd p{opacity:.85;font-size:14px}.ct{padding:24px 32px;background:#fff;border-radius:0 0 12px 12px;box-shadow:0 1px 3px rgba(0,0,0,.1)}.s{margin-bottom:28px}.st{font-size:16px;font-weight:600;margin-bottom:14px;color:#1f2937;display:flex;align-items:center;gap:8px}.badge{display:inline-block;padding:3px 12px;border-radius:20px;font-size:12px;font-weight:500}.bg{background:#d1fae5;color:#065f46}.br{background:#fee2e2;color:#991b1b}.bg2{display:flex;gap:10px;margin-top:12px}.btn{padding:10px 20px;border:none;border-radius:6px;font-size:14px;font-weight:500;cursor:pointer}.bt1{background:#4f46e5;color:#fff}.bt2{background:#10b981;color:#fff}.bt3{background:#ef4444;color:#fff}.fg{margin-bottom:14px}label{display:block;margin-bottom:5px;font-weight:500;color:#374151;font-size:13px}input[type=checkbox]{width:auto;margin-right:6px}input,select{width:100%;padding:9px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;background:#f9fafb}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}.sc{background:#f3f4f6;padding:18px;border-radius:8px;text-align:center}.sv{font-size:28px;font-weight:700;color:#4f46e5}.sl{color:#6b7280;margin-top:4px;font-size:13px}.tc{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #e5e7eb}th{background:#f9fafb;font-weight:600;color:#374151}.suc{color:#059669}.err{color:#dc2626}.errmsg{color:#dc2626;font-size:13px;margin-top:8px;padding:8px 12px;background:#fef2f2;border-radius:6px;display:none}.info{color:#6b7280;font-size:12px;margin-top:6px}.process{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:12px}.kv{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px}.kl{font-size:12px;color:#6b7280;margin-bottom:4px}.vv{font-size:13px;color:#111827;word-break:break-all}.pwrap{margin-top:12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px}.pbar{height:12px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin-top:6px}.pfill{height:100%;width:0;background:linear-gradient(90deg,#10b981,#4f46e5);transition:width .3s}.ptext{font-size:12px;color:#374151;margin-top:5px}.logbox{background:#111827;color:#d1d5db;border-radius:8px;padding:12px;max-height:260px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;white-space:pre-wrap}.errbox{background:#fef2f2;color:#991b1b;border:1px solid #fecaca;border-radius:8px;padding:10px;font-size:13px;white-space:pre-wrap;word-break:break-word}</style></head><body><div class="c"><div class="hd">
 <h1>视频自动转码工具</h1><p>自动监测文件夹 | 智能转码 | 节省空间</p></div><div class="ct">
 <div class="s"><div class="st"><span>状态</span><span id="badge" class="badge br">已停止</span></div>
 <div id="errmsg" class="errmsg"></div>
@@ -822,10 +974,11 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <div class="process">
 <div class="kv"><div class="kl">PID</div><div class="vv" id="process_pid">-</div></div>
 <div class="kv"><div class="kl">运行时长</div><div class="vv" id="process_uptime">-</div></div>
-<div class="kv"><div class="kl">当前文件</div><div class="vv" id="current_file">-</div></div>
-<div class="kv"><div class="kl">当前状态</div><div class="vv" id="current_activity">-</div></div>
+
+
 </div>
-<div class="pwrap"><div class="kl">当前文件进度</div><div class="pbar"><div class="pfill" id="progress_fill"></div></div><div class="ptext" id="progress_text">0%</div></div>
+
+<style>label:has(#use_gpu:disabled){opacity:.45}label:has(#dual_worker:disabled){opacity:.45}.skip{color:#6b7280}.skip2{color:#0891b2}.pwrap.idle{opacity:.5;background:#f3f4f6}.pwrap.idle .kl{color:#9ca3af}.pwrap.idle .pfill{width:0!important}#gpu_box{background:#eef2ff;border-color:#c7d2fe}#gpu_box .kl{color:#4338ca}#cpu_box{background:#f0fdf4;border-color:#a7f3d0}#cpu_box .kl{color:#047857}#gpu_box.idle,#cpu_box.idle{background:#f3f4f6;border-color:#e5e7eb}#gpu_fill{background:linear-gradient(90deg,#818cf8,#4f46e5)}#cpu_fill{background:linear-gradient(90deg,#34d399,#059669)}</style><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px"><div class="pwrap" id="gpu_box"><div class="kl">GPU 转码 (QSV)</div><div class="vv" id="gpu_file">-</div><div class="pbar"><div class="pfill" id="gpu_fill"></div></div><div class="ptext" id="gpu_text">空闲</div><div class="ptext" id="gpu_eta"></div></div><div class="pwrap" id="cpu_box"><div class="kl">CPU 转码 (x265)</div><div class="vv" id="cpu_file">-</div><div class="pbar"><div class="pfill" id="cpu_fill"></div></div><div class="ptext" id="cpu_text">空闲</div><div class="ptext" id="cpu_eta"></div></div></div>
 <div style="margin-top:12px"><div class="kl">最近错误</div><div class="errbox" id="last_error_text">无</div></div>
 <div style="margin-top:12px"><div class="kl">最近转码输出</div><pre class="logbox" id="recent_log">暂无日志</pre></div>
 </div>
@@ -834,18 +987,20 @@ HTML = '''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <div id="dirs_list" class="dirs_list"></div>
 <div style="display:flex;gap:8px"><input type="text" id="monitor_dir" value="{{config.monitor_dir}}" placeholder="点击浏览或直接输入授权目录"><button class="btn bt1" style="padding:9px 14px;white-space:nowrap" onclick="openBrowser()">浏览</button><button class="btn bt2" style="padding:9px 14px;white-space:nowrap" onclick="addDir()">添加</button></div>
 <div class="info">点击"添加"将该目录加入监控列表；每轮扫描一次，可同时监控多个目录。</div></div>
+<div class="fg"><label>最小文件大小 (MB，0=不跳过)</label><input type="number" id="min_file_size" min="0" max="10000" value="{{config.min_file_size|default(10)}}"></div>
 <div class="fg"><label>分辨率策略</label><select id="resize_mode" onchange="toggleResizeCustom()"><option value="1080p" {%if config.resize_mode=="1080p"%}selected{%endif%}>缩放至 1080p（高清）</option><option value="keep" {%if config.resize_mode=="keep"%}selected{%endif%}>保持原分辨率</option><option value="custom" {%if config.resize_mode=="custom"%}selected{%endif%}>自定义</option></select></div>
 <div class="fg" id="custom_resize_wrap" style="display:none"><label>自定义分辨率参数（示例：<code>-2:1080</code>、<code>1920:-2</code> 或 <code>scale=-2:1080</code>；仅支持 scale，禁止特殊字符）</label><input type="text" id="custom_resize" value="{{config.custom_resize}}" placeholder="如 -2:1080"></div>
-<div class="fg"><label>CRF (18-32, 越小质量越高；已限制最低 18 防止过载)</label><input type="number" id="crf" min="18" max="32" value="{{config.crf}}"></div>
+<div class="fg"><label>CRF (12-32，越小质量越高；越低体积越大)</label><input type="number" id="crf" min="12" max="32" value="{{config.crf}}"></div>
 <div class="fg"><label>编码预设 (越慢越省空间)</label><select id="preset">{% for p in ['ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow'] %}<option value="{{p}}" {%if p==config.preset%}selected{%endif%}>{{p}}</option>{%endfor%}</select></div>
-<div class="fg"><label>线程数 (最多 4，保护系统负载)</label><input type="number" id="threads" min="1" max="4" value="{{config.threads}}"></div>
+<div class="fg"><label>线程数 (0=自动，最多 {{max_threads}})</label><input type="number" id="threads" min="0" max="{{max_threads}}" value="{{config.threads}}"></div>
 <div class="fg"><label>编码器</label><select id="codec"><option value="libx264" {%if config.codec=="libx264"%}selected{%endif%}>H.264 (兼容性好)</option><option value="libx265" {%if config.codec=="libx265"%}selected{%endif%}>H.265 (更省空间)</option></select></div>
 <div class="fg"><label>格式</label><select id="container"><option value="mp4" {%if config.container=="mp4"%}selected{%endif%}>MP4</option><option value="mkv" {%if config.container=="mkv"%}selected{%endif%}>MKV</option></select></div>
-<div class="fg"><label><input type="checkbox" id="use_gpu" {%if config.use_gpu%}checked{%endif%}> GPU加速 (QSV)</label></div>
+<div class="fg"><label><input type="checkbox" id="use_gpu" {%if config.use_gpu%}checked{%endif%} onchange="syncDual()"> GPU加速 (QSV)</label><div class="info" id="gpu_hint"></div></div>
+<div class="fg"><label><input type="checkbox" id="dual_worker" {%if config.dual_worker%}checked{%endif%}> GPU + CPU 同时转码（双 worker）</label><div class="info">开启后 GPU 走 QSV、CPU 走 x265，各跑一个任务。</div></div>
 <button class="btn bt1" onclick="saveCfg()">保存配置</button>
 <div class="info">日志: {{conv_log}} | 数据库: {{db_path}}</div>
 </div>
-<div class="s"><div class="st">统计</div><div class="stats"><div class="sc"><div class="sv" id="ts">0</div><div class="sl">节省(MB)</div></div><div class="sc"><div class="sv" id="tc2">0</div><div class="sl">处理文件</div></div></div></div>
+<div class="s"><div class="st">统计</div><div class="stats"><div class="sc"><div class="sv" id="tp">-</div><div class="sl">待处理文件</div></div><div class="sc"><div class="sv" id="tc2">0</div><div class="sl">已处理文件</div></div><div class="sc"><div class="sv" id="ts">0</div><div class="sl">节省(GB)</div></div></div></div>
 <div class="s"><div class="st"><span>问题文件（损坏 / 转码失败）</span><button class="btn bt1" style="padding:4px 12px;font-size:12px;background:#6b7280" onclick="loadProblems()">刷新</button></div>
 <div id="prob_empty" class="info">暂无问题文件</div>
 <div class="tc" id="prob_wrap" style="display:none"><table><thead><tr><th>文件</th><th>失败原因</th><th>重试次数</th><th>大小(MB)</th><th>操作</th></tr></thead><tbody id="prob_tb"></tbody></table></div>
@@ -858,8 +1013,11 @@ function addDir(){let v=(el('monitor_dir').value||'').trim();if(!v){alert('请�
 function removeDir(i){monitorDirs.splice(i,1);renderDirs();saveCfg()}
 function renderDirs(){let L=el('dirs_list');L.innerHTML='';if(!monitorDirs.length){L.innerHTML='<div class="info" style="margin-bottom:6px">尚未添加任何监控目录</div>';return}monitorDirs.forEach((d,i)=>{let w=document.createElement('div');w.className='dir_item';let sp=document.createElement('span');sp.textContent=d;sp.style.wordBreak='break-all';let rm=document.createElement('button');rm.textContent='删除';rm.className='btn bt3';rm.style.cssText='padding:3px 10px;font-size:12px;flex-shrink:0';rm.onclick=()=>removeDir(i);w.appendChild(sp);w.appendChild(rm);L.appendChild(w)})}
 function toggleResizeCustom(){let m=el('resize_mode').value;el('custom_resize_wrap').style.display=(m==='custom')?'block':'none'}
-function saveCfg(){let d={monitor_dirs:monitorDirs,crf:parseInt(el('crf').value),preset:el('preset').value,threads:parseInt(el('threads').value),codec:el('codec').value,container:el('container').value,use_gpu:el('use_gpu').checked,resize_mode:el('resize_mode').value,custom_resize:el('custom_resize').value};fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}).then(d=>{if(d.success)alert('已保存');else alert('保存失败')}).catch(e=>alert('保存失败: '+e.message))}
-async function refresh(){try{let s=await fetch('/api/status').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false,el('resize_mode').value=s.config.resize_mode||'1080p',el('custom_resize').value=s.config.custom_resize||'');if(s.config&&s.config.monitor_dirs){let nd=(s.config.monitor_dirs||[]).filter(x=>x);if(nd.join('|')!==monitorDirs.join('|')){monitorDirs=nd;renderDirs()}}toggleResizeCustom();let p=s.process||{};el('process_pid').textContent=p.pid||'-';el('process_uptime').textContent=p.uptime_seconds!=null?(p.uptime_seconds+' 秒'):'-';el('current_file').textContent=p.current_file||'-';el('current_activity').textContent=p.current_activity||'-';let pct=Math.max(0,Math.min(100,Number(p.progress_percent||0)));el('progress_fill').style.width=pct+'%';el('progress_text').textContent=pct.toFixed(1)+'%';el('last_error_text').textContent=s.error||p.last_error||'无';el('recent_log').textContent=(s.recent_log&&s.recent_log.length)?s.recent_log.join('\\n'):'暂无日志';let l=await fetch('/api/logs').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});el('ts').textContent=l.total_saved_mb;el('tc2').textContent=l.total_count!=null?l.total_count:l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});let sd=document.createElement('td');sd.textContent=r.success?'成功':'失败';sd.className=r.success?'suc':'err';tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}catch(e){console.error('refresh error:',e)}}
+function applyGpuAvail(s){let g=el('use_gpu'),h=el('gpu_hint');let ok=((s.gpu_devices||[]).length>0);if(!g)return;g.disabled=!ok;if(!ok){g.checked=false;}if(h)h.textContent=ok?'':'未检测到可用的 /dev/dri 渲染设备，已禁用 GPU 加速';syncDual()}
+function fmtDur(v){v=Number(v)||0;if(v<60)return v+' 秒';let m=Math.floor(v/60);if(m<60)return m+' 分 '+(v%60)+' 秒';let h=Math.floor(m/60);return h+' 小时 '+(m%60)+' 分'}
+function syncDual(){let g=el('use_gpu'),d=el('dual_worker');if(!g||!d)return;d.disabled=!g.checked;if(!g.checked)d.checked=false}
+function saveCfg(){let d={monitor_dirs:monitorDirs,crf:parseInt(el('crf').value),preset:el('preset').value,threads:parseInt(el('threads').value),min_file_size:parseInt(el('min_file_size').value)||0,codec:el('codec').value,container:el('container').value,use_gpu:el('use_gpu').checked,dual_worker:el('use_gpu').checked&&el('dual_worker').checked,resize_mode:el('resize_mode').value,custom_resize:el('custom_resize').value};fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()}).then(d=>{if(d.success)alert('已保存');else alert('保存失败')}).catch(e=>alert('保存失败: '+e.message))}
+async function refresh(){try{let s=await fetch('/api/status').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});let b=el('badge');b.textContent=s.running?'运行中':'已停止';b.className='badge '+(s.running?'bg':'br');s.config&&(el('monitor_dir').value=s.config.monitor_dir,el('crf').value=s.config.crf,el('preset').value=s.config.preset,el('threads').value=s.config.threads,el('min_file_size').value=s.config.min_file_size!=null?s.config.min_file_size:10,el('codec').value=s.config.codec,el('container').value=s.config.container,el('use_gpu').checked=s.config.use_gpu!==false,el('dual_worker').checked=s.config.dual_worker!==false,syncDual(),el('resize_mode').value=s.config.resize_mode||'1080p',el('custom_resize').value=s.config.custom_resize||'');if(s.config&&s.config.monitor_dirs){let nd=(s.config.monitor_dirs||[]).filter(x=>x);if(nd.join('|')!==monitorDirs.join('|')){monitorDirs=nd;renderDirs()}}toggleResizeCustom();applyGpuAvail(s);let p=s.process||{};el('process_pid').textContent=p.pid||'-';el('process_uptime').textContent=p.uptime_seconds!=null?fmtDur(p.uptime_seconds):'-';let pct=0;let _w=p.workers||{};['gpu','cpu'].forEach(function(k){let o=_w[k]||{},f=el(k+'_file'),fl=el(k+'_fill'),tx=el(k+'_text'),box=el(k+'_box');if(!f)return;let busy=!!(o.file||o.activity);if(box)box.className='pwrap'+(busy?'':' idle');f.textContent=o.file||'-';let pc=Math.max(0,Math.min(100,Number(o.percent||0)));fl.style.width=pc+'%';let et=el(k+'_eta');if(et)et.textContent=(busy&&o.eta>0)?('剩余约 '+fmtDur(o.eta)):'';tx.textContent=!busy?'空闲':(pc>0?pc.toFixed(1)+'%':((o.activity||'').indexOf('等待')>=0?'等待中':((o.activity||'').indexOf('跳过')>=0?'跳过':'进行中')))});el('last_error_text').textContent=s.error||p.last_error||'无';el('recent_log').textContent=(s.recent_log&&s.recent_log.length)?s.recent_log.join('\\n'):'暂无日志';let l=await fetch('/api/logs').then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});el('tp').textContent=(l.pending!=null?l.pending:'-');el('ts').textContent=(l.total_saved_mb/1024).toFixed(2);el('tc2').textContent=l.total_count!=null?l.total_count:l.logs.length;let t=el('tb');t.innerHTML='';l.logs.forEach(r=>{let tr=document.createElement('tr');['filepath','file_size_mb','saved_size_mb'].forEach(k=>{let td=document.createElement('td');td.textContent=r[k];tr.appendChild(td)});if(r.success&&r.saved_size>=0){if(r.worker==='gpu'){tr.style.background='#f2f5ff'}else if(r.worker==='cpu'){tr.style.background='#f1fbf5'}}let sd=document.createElement('td');if(r.saved_size===0&&r.success){sd.textContent='成功';sd.className='suc'}else if(r.saved_size===-2){sd.textContent='达标';sd.className='skip2'}else if(r.saved_size<0){sd.textContent='跳过';sd.className='skip'}else if(r.success){sd.textContent='成功';sd.className='suc'}else{sd.textContent='失败';sd.className='err'}tr.appendChild(sd);let td=document.createElement('td');td.textContent=r.processed_at;tr.appendChild(td);t.appendChild(tr)})}catch(e){console.error('refresh error:',e)}}
 function el(id){return document.getElementById(id)}
 var browsePath='/';
 async function openBrowser(p){if(p){browsePath=p}else{let v=(el('monitor_dir').value||'').trim();browsePath=v.startsWith('/')?v:'/'}try{let d=await fetch('/api/browse?path='+encodeURIComponent(browsePath)).then(r=>{if(!r.ok)return r.json().then(j=>{throw new Error(j.error||r.status)});return r.json()});if(d.error){alert(d.error);return}let m=el('modal'),lst=el('blist');browsePath=d.path;el('bpath').textContent=d.path;if(el('browser_path_input'))el('browser_path_input').value=d.path;lst.innerHTML='';if(d.message){let tip=document.createElement('div');tip.style.cssText='padding:12px 14px;background:#fef3c7;color:#78350f;border-radius:8px;margin-bottom:10px;white-space:pre-wrap;font-size:13px;line-height:1.5';tip.textContent=d.message;lst.appendChild(tip)}if(d.path!=='/'){let b=document.createElement('div');b.className='bitem';b.textContent='.. 返回上级';b.onclick=()=>openBrowser(d.path.split('/').slice(0,-1).join('/')||'/');lst.appendChild(b)}d.entries.forEach(e=>{let b=document.createElement('div');b.className='bitem';b.textContent=e.name+(e.is_dir?'/':'');if(e.pinned){b.style.fontWeight='600';b.title='已保存的监控目录'}if(e.no_access){b.style.opacity='0.4';b.title='无权限';if(e.is_dir)b.onclick=()=>alert('无权限访问此目录（请在应用设置 → 授权目录中授予读写权限）')}else if(e.is_dir){b.onclick=()=>openBrowser(e.path)}else{b.style.opacity='0.5'}lst.appendChild(b)});m.style.display='flex'}catch(e){alert('浏览目录失败: '+e.message)}}

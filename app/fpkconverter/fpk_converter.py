@@ -12,7 +12,7 @@ import hashlib
 import re
 from pathlib import Path
 
-VERSION = '1.0.56'
+VERSION = '1.0.56-dual.1'
 
 
 class Database:
@@ -28,6 +28,43 @@ class Database:
         except Exception:
             pass
         self._init_database()
+        self._migrate()
+
+    def _migrate(self):
+        try:
+            conn = self._get_connection()
+            try:
+                conn.execute('ALTER TABLE processed_files ADD COLUMN worker TEXT DEFAULT ""')
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass
+
+    def backup_database(self, keep=7):
+        try:
+            db_dir = os.path.dirname(os.path.abspath(self.db_path)) or '.'
+            dest = os.path.join(db_dir, 'fpk_converter.db.bak-' + time.strftime('%Y%m%d'))
+            if os.path.exists(dest):
+                return dest
+            src = sqlite3.connect(self.db_path, timeout=10)
+            dst = sqlite3.connect(dest)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+                src.close()
+            names = sorted(f for f in os.listdir(db_dir) if f.startswith('fpk_converter.db.bak-'))
+            for f in names[:-keep]:
+                try:
+                    os.remove(os.path.join(db_dir, f))
+                except OSError:
+                    pass
+            print(f"数据库已备份: {dest}")
+            return dest
+        except Exception as e:
+            print(f"数据库备份失败: {e}")
+            return ''
 
     def _get_connection(self):
         max_retries = 3
@@ -109,16 +146,16 @@ class Database:
             print(f"数据库查询失败: {e}")
             return False, False
 
-    def add_processed_file(self, filepath, file_size, success, saved_size=0):
+    def add_processed_file(self, filepath, file_size, success, saved_size=0, worker=''):
         try:
             conn = self._get_connection()
             try:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT OR REPLACE INTO processed_files 
-                    (filepath, file_size, success, saved_size)
-                    VALUES (?, ?, ?, ?)
-                ''', (str(filepath), file_size, int(success), saved_size))
+                    (filepath, file_size, success, saved_size, processed_at, worker)
+                    VALUES (?, ?, ?, ?, datetime('now', 'localtime'), ?)
+                ''', (str(filepath), file_size, int(success), saved_size, worker))
                 conn.commit()
             finally:
                 conn.close()
@@ -147,11 +184,16 @@ class Database:
             try:
                 cursor = conn.cursor()
                 cursor.execute('SELECT id, filepath FROM processed_files')
+                _rows = cursor.fetchall()
                 stale_ids = []
-                for row in cursor.fetchall():
+                for row in _rows:
                     record_id, filepath = row[0], row[1]
                     if not os.path.exists(filepath):
                         stale_ids.append((record_id,))
+                if len(_rows) >= 20 and len(stale_ids) > len(_rows) * 0.3:
+                    print(f"跳过清理: 本次将删除 {len(stale_ids)}/{len(_rows)} 条记录，超过 30% 熔断阈值"
+                          f"（通常是卷未挂载或目录被改名），如确认无误请手动清理")
+                    return 0
                 if stale_ids:
                     cursor.executemany('DELETE FROM processed_files WHERE id = ?', stale_ids)
                     removed += len(stale_ids)
@@ -261,12 +303,12 @@ class VideoConverter:
     ALLOWED_CONTAINERS = {'mp4', 'mkv'}
     ALLOWED_PRESETS = {'ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'}
     
-    MAX_BITRATE = 13 * 1000 * 1000  # 13 Mbps
+    MAX_BITRATE = 30 * 1000 * 1000  # 30 Mbps
     SKIP_FILE_SIZE = 10 * 1000 * 1000  # 10 MB - 小于此大小的文件跳过
     SKIP_BITRATE = 5000 * 1000  # 5000 kbps = 5 Mbps - HEVC 1080p 低于此码率跳过
-    TRANSCODE_DELAY = 300  # 5 分钟：等待文件写入稳定后再转码
+    TRANSCODE_DELAY = 120  # 2 分钟  # 临时 10 秒（原 300 秒）
     TEMP_MAX_GB = 30
-    MIN_CRF = 18
+    MIN_CRF = 12
     MAX_CRF = 32
     MAX_THREADS = 4
     FAILURE_RETRY_DELAYS = (1800, 7200, 21600)  # 30分钟、2小时、6小时
@@ -275,15 +317,38 @@ class VideoConverter:
     TEMP_LOG_MAX_AGE_SECONDS = 7 * 24 * 3600
 
     def __init__(self, db, target_quality=23, codec='libx264', container='mp4',
-                 preset='medium', threads=1, use_gpu=True, temp_dir=''):
+                 preset='medium', threads=1, use_gpu=True, temp_dir='', min_file_size_mb=10,
+                 dual_worker=False):
         self.db = db
         self.target_quality = max(self.MIN_CRF, min(self.MAX_CRF, int(target_quality)))
         self.codec = codec if codec in self.ALLOWED_CODECS else 'libx265'
         self.container = container if container in self.ALLOWED_CONTAINERS else 'mp4'
         self.preset = preset if preset in self.ALLOWED_PRESETS else 'medium'
-        self.threads = max(1, min(self.MAX_THREADS, int(threads)))
+        try:
+            _t = int(threads)
+        except (TypeError, ValueError):
+            _t = 1
+        self.MAX_THREADS = os.cpu_count() or 4
+        if _t <= 0:
+            _t = max(1, self.MAX_THREADS // 2)
+            print(f"线程数自动: CPU {self.MAX_THREADS} 核 -> 每 worker {_t} 线程")
+        self.threads = max(1, min(self.MAX_THREADS, _t))
         self.use_gpu = bool(use_gpu)
         self.temp_dir = Path(temp_dir) if temp_dir and str(temp_dir).strip() else None
+        self.min_file_size = min_file_size_mb * 1024 * 1024
+        self.dual_worker = bool(dual_worker)  # FPKC-DUAL
+        self._worker_modes = threading.local()
+        self._workers_alive = set()
+        try:
+            _orig_add = self.db.add_processed_file
+            def _add_with_worker(path, size, ok, saved=0):
+                tag = getattr(self._worker_modes, 'tag', '')
+                dev = 'gpu' if '[GPU]' in tag else ('cpu' if '[CPU]' in tag else '')
+                return _orig_add(path, size, ok, saved, dev)
+            self.db.add_processed_file = _add_with_worker
+        except Exception:
+            pass
+        self._base_use_gpu = bool(use_gpu)
         if self.temp_dir and not self.temp_dir.exists():
             self.temp_dir.mkdir(parents=True, exist_ok=True)
         self._queue = []
@@ -301,6 +366,16 @@ class VideoConverter:
         # custom 模式下用户填写的 ffmpeg 滤镜参数（仅允许安全白名单，防命令注入）
         self.custom_resize = ''
 
+    @property
+    def use_gpu(self):
+        modes = getattr(self, '_worker_modes', None)
+        base = getattr(self, '_base_use_gpu', True)
+        return base if modes is None else getattr(modes, 'use_gpu', base)
+
+    @use_gpu.setter
+    def use_gpu(self, value):
+        self._base_use_gpu = bool(value)
+
     def _now(self):
         return time.time()
 
@@ -310,8 +385,8 @@ class VideoConverter:
     def _validate_path(self, filepath):
         try:
             filepath = Path(filepath)
-            # 在 resolve 之前检查路径遍历
-            if '..' in str(filepath):
+            # 只拒绝真正的路径穿越片段，不能误伤文件名里的 ".."（如 xxx..mp4）
+            if '..' in Path(filepath).parts:
                 return None
             filepath = filepath.resolve()
         except (OSError, ValueError, RuntimeError):
@@ -330,7 +405,7 @@ class VideoConverter:
                 return False
             self.recent_events[filepath_str] = now
             if len(self.recent_events) > 200:
-                cutoff = now - 300
+                cutoff = now - 120
                 self.recent_events = {k: v for k, v in self.recent_events.items() if v > cutoff}
             return True
 
@@ -429,7 +504,7 @@ class VideoConverter:
             except Exception:
                 pass
 
-    def startup_cleanup(self):
+    def startup_cleanup(self, monitor_dir=None):
         """启动时清理旧版残留的临时转码文件和日志，压缩数据库。
         不会删除最近 5 分钟内创建的文件（可能正在使用），也不会删除数据库中的有效记录。"""
         now = self._now()
@@ -445,15 +520,19 @@ class VideoConverter:
                     continue
                 try:
                     age = now - item.stat().st_mtime
-                    if age < 300:
+                    if age < 120:
                         continue
                     item.unlink()
                 except Exception:
                     pass
         if self.db:
-            removed = self.db.cleanup_and_vacuum()
-            if removed > 0:
-                print(f"启动清理: 删除了 {removed} 条过期数据库记录并压缩数据库")
+            self.db.backup_database()
+            if monitor_dir and not os.path.isdir(monitor_dir):
+                print(f"启动清理已跳过：监控目录不可访问 {monitor_dir}（可能是卷未挂载），本次不做记录清理")
+            else:
+                removed = self.db.cleanup_and_vacuum()
+                if removed > 0:
+                    print(f"启动清理: 删除了 {removed} 条过期数据库记录并压缩数据库")
 
     def _mediasrv_path(self):
         for path in ('/usr/trim/lib/mediasrv',):
@@ -752,20 +831,31 @@ class VideoConverter:
 
     def _ensure_worker(self):
         with self._queue_lock:
-            if self._worker_running:
+            if self.dual_worker:
+                targets = [w for w in (0, 1) if w not in self._workers_alive]
+            else:
+                targets = [] if self._workers_alive else [0]
+            if not targets:
                 return
-            self._worker_running = True
-        t = threading.Thread(target=self._serial_worker, daemon=True)
-        t.start()
+            for w in targets:
+                self._workers_alive.add(w)
+        for w in targets:
+            threading.Thread(target=self._serial_worker, args=(w,), daemon=True).start()
 
-    def _serial_worker(self):
+    def _serial_worker(self, worker_id=0):
+        if self.dual_worker:
+            self._worker_modes.use_gpu = (worker_id == 0)
+            self._worker_modes.tag = '[GPU] ' if worker_id == 0 else '[CPU] '
+        else:
+            self._worker_modes.use_gpu = self._base_use_gpu
+            self._worker_modes.tag = '[GPU] ' if self._base_use_gpu else '[CPU] '
         while True:
             item = None
             with self._queue_lock:
                 if self._queue:
                     item = self._queue.pop(0)
                 else:
-                    self._worker_running = False
+                    self._workers_alive.discard(worker_id)
                     return
             
             filepath_str = item['path']
@@ -783,7 +873,7 @@ class VideoConverter:
                         break
                     remaining = int(wait_until - time.time())
                     if last_wait_log == 0 or time.time() - last_wait_log >= 30 or remaining <= 5:
-                        print(f"文件已入队，等待文件稳定: {filepath_str}，剩余约 {max(0, remaining)} 秒")
+                        print(f"{self._worker_modes.tag}文件已入队，等待文件稳定: {filepath_str}，剩余约 {max(0, remaining)} 秒")
                         last_wait_log = time.time()
                     time.sleep(min(5, max(1, remaining)))
                 
@@ -808,8 +898,17 @@ class VideoConverter:
                 self._enforce_temp_limit()
                 self._cleanup_transcode_logs()
                 
-                print(f"[SERIAL] 开始处理: {filepath_str}")
+                print(f"{self._worker_modes.tag}[SERIAL] 开始处理: {filepath_str}")
                 success, _ = self.convert_video(filepath)
+                if not success and getattr(self._worker_modes, 'use_gpu', False):
+                    print(f"{self._worker_modes.tag}GPU 转码失败，改用 CPU 兜底重试: {filepath_str}")
+                    self._worker_modes.use_gpu = False
+                    self._worker_modes.tag = '[CPU] '
+                    try:
+                        success, _ = self.convert_video(filepath)
+                    finally:
+                        self._worker_modes.use_gpu = True
+                        self._worker_modes.tag = '[GPU] '
                 if success:
                     self._clear_failure_retry(filepath_str)
                 else:
@@ -843,7 +942,7 @@ class VideoConverter:
                     break
                 # 跳过最近5分钟内创建的文件，可能正在使用
                 try:
-                    if now - f.stat().st_mtime < 300:
+                    if now - f.stat().st_mtime < 120:
                         continue
                 except Exception:
                     continue
@@ -900,18 +999,34 @@ class VideoConverter:
             cmd.extend(['-qsv_device', qsv_device])
         if progress:
             cmd.extend(['-progress', 'pipe:1'])
+        # QSV 路径优先硬解：帧全程留在显存，CPU 只做解复用/封装
+        _hwdec = bool(is_qsv and self.use_gpu and not needs_resize)
+        if _hwdec:
+            cmd.extend(['-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv'])
         cmd.extend(['-i', str(input_path)])
         cmd.extend(['-c:v', target_codec])
 
         if is_qsv:
             cmd.extend(['-preset', 'medium'])
-            cmd.extend(['-global_quality', str(self.target_quality)])
+            # QSV 的 global_quality 与 x265 的 CRF 不同刻度：
+            # 同数字下 QSV 画质更高、体积更大，加 6 后体积才接近 x265 同 CRF。
+            _gq = min(51, int(self.target_quality) + 4)
+            cmd.extend(['-global_quality', str(_gq)])
+            cmd.extend(['-look_ahead', '30'])
+            cmd.extend(['-extbrc', '1'])
+            cmd.extend(['-b_strategy', '1'])
         else:
             cmd.extend(['-preset', preset_override or self.preset])
             cmd.extend(['-crf', str(self.target_quality)])
             cmd.extend(['-maxrate', f'{self.MAX_BITRATE}'])
             cmd.extend(['-bufsize', f'{self.MAX_BITRATE * 2}'])
-        cmd.extend(['-threads', str(self.threads)])
+        _dual = bool(getattr(self, 'dual_worker', False))
+        if self.use_gpu and _dual:
+            # 双路时 GPU 这条尽量少占 CPU：软解 1 线程、滤镜 1 线程
+            _th = 2 if (os.cpu_count() or 4) >= 8 else 1
+            cmd.extend(['-threads', str(_th), '-filter_threads', str(_th)])
+        else:
+            cmd.extend(['-threads', str(self.threads)])
 
         if needs_resize:
             if hasattr(self, 'resize_mode') and self.resize_mode == 'custom' and self.custom_resize:
@@ -934,6 +1049,11 @@ class VideoConverter:
         for key, arg in color_arg_map:
             value = color_info.get(key)
             if value and value != 'unknown':
+                if _hwdec and key == 'pix_fmt':
+                    continue
+                if is_qsv and key == 'pix_fmt':
+                    # QSV 只支持 NV12/P010(4:2:0)，4:2:2/4:4:4 源降采样后再编码
+                    value = 'p010' if ('10le' in value or value in ('p010le', 'p012le')) else 'nv12'
                 cmd.extend([arg, str(value)])
 
         cmd.extend(['-c:a', 'copy'])
@@ -972,7 +1092,7 @@ class VideoConverter:
                     percent = max(0.0, min(99.9, out_ms / 1000000 / duration_seconds * 100))
                     now = time.time()
                     if now - last_progress_log >= 5 or percent >= 99:
-                        print(f"转码进度: {percent:.1f}% | 当前文件: {source_path}")
+                        print(f"{getattr(self._worker_modes, 'tag', '')}转码进度: {percent:.1f}% | 当前文件: {source_path}")
                         last_progress_log = now
                 try:
                     returncode = proc.wait(timeout=3600)
@@ -1018,9 +1138,9 @@ class VideoConverter:
             print(f"获取文件大小失败，跳过: {input_path}")
             return False, 0
 
-        if original_size < self.SKIP_FILE_SIZE:
-            print(f"文件太小 ({original_size / (1024*1024):.2f} MB < 10 MB)，跳过: {input_path}")
-            self.db.add_processed_file(input_path, original_size, True, 0)
+        if original_size < self.min_file_size:
+            print(f"文件太小 ({original_size / (1024*1024):.2f} MB < {self.min_file_size / (1024*1024):.0f} MB)，跳过: {input_path}")
+            self.db.add_processed_file(input_path, original_size, True, -1)
             return True, 0
 
         # 检查 ffmpeg 是否可用
@@ -1046,7 +1166,7 @@ class VideoConverter:
         print(f"视频信息: {width}x{height}, 编码: {codec}, 码率: {bit_rate_mbps:.2f} Mbps, 大小: {original_size / (1024*1024):.2f} MB")
         
         if self.should_skip_transcode(video_info):
-            self.db.add_processed_file(input_path, original_size, True, 0)
+            self.db.add_processed_file(input_path, original_size, True, -2)
             return True, 0
         
         # 勾选 GPU 时严格只使用 QSV；QSV 不可用就失败停止，不再自动 CPU 降级。
@@ -1088,9 +1208,9 @@ class VideoConverter:
             print(f"QSV/GPU 环境: ffmpeg={self._ffmpeg_binary()}, "
                   f"LIBVA_DRIVER_NAME={env.get('LIBVA_DRIVER_NAME', '')}, "
                   f"LIBVA_DRIVERS_PATH={env.get('LIBVA_DRIVERS_PATH', '')}")
-        print(f"开始转码: {input_path} (大小: {original_size / (1024*1024):.2f} MB)")
+        print(f"{self._worker_modes.tag}开始转码: {input_path} (大小: {original_size / (1024*1024):.2f} MB)")
 
-        unique_id = f"{os.getpid()}_{int(time.time())}"
+        unique_id = f"{os.getpid()}_{int(time.time())}_{threading.get_ident() % 1000}"
         safe_stem = self._safe_temp_stem(input_path)
         if self.temp_dir and self.temp_dir.is_dir():
             output_path = self.temp_dir / f"{safe_stem}_tmp_{unique_id}.{self.container}"
@@ -1293,7 +1413,7 @@ class FolderScanner:
     def start(self):
         # 启动时清理旧版残留的临时文件、过期数据库记录并压缩数据库
         if hasattr(self.converter, 'startup_cleanup'):
-            self.converter.startup_cleanup()
+            self.converter.startup_cleanup(self.folder_path)
         elif hasattr(self.converter, 'db') and self.converter.db:
             removed = self.converter.db.cleanup_stale_records()
             if removed > 0:

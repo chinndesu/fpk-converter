@@ -1,7 +1,7 @@
-__pycache__/
-*.pyc
-*.fpk
-*.so
-.tools/
 boot.log
 crash.log
+*.fpk
+*.pyc
+__pycache__/
+*.so
+.tools/
