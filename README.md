@@ -39,4 +39,3 @@
 ## 说明
 
 - 本应用以 Root 权限运行，以便 ffmpeg 访问 `/dev/dri/renderD*`，请确认信任安装包来源
-- 详细改动清单见 [CHANGES-dual-worker.md](./CHANGES-dual-worker.md)
